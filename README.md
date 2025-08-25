@@ -17,13 +17,19 @@ This project provides a reliable and automated fingerprint-based personal identi
 ## 🏗️ Project Structure
 fingerprint_id/
 ├── app/ # GUI, API, CLI
+<br>
 ├── core/ # Image processing & matching
+<br>
 ├── security/ # Encryption & authentication
+<br>
 ├── storage/ # Database handling
+<br>
 ├── utils/ # Helpers & configs
+<br>
 ├── tests/ # Unit tests
+<br>
 └── notebooks/ # Experiments & evaluations
-
+<br>
 
 ## ⚙️ Tech Stack
 - **Python 3.10+**
