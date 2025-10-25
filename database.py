@@ -1,12 +1,13 @@
--- Step 1: Create Database
-CREATE DATABASE forensic_fingerprint;
-USE forensic_fingerprint;
+CREATE DATABASE fingerprints_db;
+USE fingerprints_db;
 
-CREATE TABLE users (
-    user_id INT AUTO_INCREMENT PRIMARY KEY,   -- Unique ID for each user
-    name VARCHAR(100) NOT NULL,               -- User's name
-    fingerprint LONGBLOB NOT NULL,            -- Fingerprint template (binary data)
-    photo LONGBLOB,                           -- Photo storage (binary data)
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- Record creation time
+CREATE TABLE students (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    fingerprint LONGBLOB NOT NULL,
+    minutiae LONGBLOB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-describe users ;
+
+ALTER TABLE students
+  MODIFY fingerprint LONGBLOB NULL DEFAULT NULL;
