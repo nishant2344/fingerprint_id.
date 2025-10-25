@@ -1,3 +1,14 @@
+"""
+Fingerprint verfication app with:
+ - improved preprocessing & minutiae extraction
+ - RANSAC-based alignment for rotation/translation invariance
+ - Export / Import DB functionality (JSON + base64 encoded images)
+ - Simple admin login (username/password stored hashed in DB) 
+ -Username- admin  Password- admin123
+ 
+ Update DB_CONFIG below before running.
+"""
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
@@ -9,6 +20,8 @@ import io
 import json
 import math
 import logging
+import base64
+import hashlib
 import time
 from contextlib import closing
 
@@ -20,82 +33,100 @@ DB_CONFIG = {
     "database": "fingerprints_db"
 }
 
-# Tuning parameters
-SPATIAL_TOLERANCE = 12   # pixels tolerance for matching minutiae
-ANGLE_TOLERANCE = 25.0   # degrees tolerance for orientation match
-MATCH_THRESHOLD = 0.55   # fraction threshold to declare a match
+# Admin default credentials (created if users table empty)
+DEFAULT_ADMIN_USER = "admin"
+DEFAULT_ADMIN_PASS = "admin123"
 
-# Setup logging
-logging.basicConfig(
-    filename='fingerprint_app.log',
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+# Matching / RANSAC parameters
+SPATIAL_TOLERANCE = 20   # initial candidate distance to consider pairing (px)
+ANGLE_TOLERANCE = 30.0   # degrees allowed difference for candidate pair filtering
+RANSAC_REPROJ_THRESH = 6.0
+MATCH_THRESHOLD = 0.5    # fraction to accept a match (inliers / max points)
 
-# ----------------- Database Setup -----------------
+# Logging
+logging.basicConfig(filename='fingerprint_app.log', level=logging.INFO,
+                    format='%(asctime)s [%(levelname)s] %(message)s')
+
+# ----------------- Database Helpers -----------------
 def connect_db():
     try:
         cnx = mysql.connector.connect(**DB_CONFIG)
         return cnx
     except mysql.connector.Error as err:
-        logging.exception("DB connection failed")
+        logging.exception("DB connect failed")
         messagebox.showerror("Database Error", f"Error connecting to DB:\n{err}")
         return None
 
-def ensure_tables():
+def ensure_schema():
+    """Create students and users tables if missing; ensure 'name' unique."""
     cnx = connect_db()
     if cnx is None:
         return False
     try:
-        with closing(cnx.cursor()) as cursor:
-            cursor.execute("""
+        with closing(cnx.cursor()) as cur:
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS students (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255),
-                    minutiae JSON,
+                    name VARCHAR(255) NOT NULL,
+                    fingerprint LONGBLOB NULL,
+                    minutiae LONGTEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_name (name)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(100) NOT NULL UNIQUE,
+                    password_hash VARCHAR(256) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Ensure a default admin user exists (only insert if not present)
+            cur.execute("SELECT COUNT(*) FROM users")
+            (count,) = cur.fetchone()
+            if count == 0:
+                ph = hash_password(DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS)
+                cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+                            (DEFAULT_ADMIN_USER, ph))
         cnx.commit()
     except Exception as e:
-        logging.exception("Failed to ensure tables")
-        messagebox.showerror("DB Error", f"Failed to create tables:\n{e}")
+        logging.exception("Schema ensure failed")
+        messagebox.showerror("DB Error", f"Failed to create/ensure tables:\n{e}")
         return False
     finally:
         cnx.close()
     return True
 
-# ----------------- Preprocessing Helpers -----------------
+# ----------------- Password Hashing -----------------
+def hash_password(username, password):
+    """Hash password using SHA-256 with username as salt (simple approach)."""
+    salt = username.encode('utf-8')
+    return hashlib.sha256(salt + password.encode('utf-8')).hexdigest()
+
+def verify_password(username, password, stored_hash):
+    return hash_password(username, password) == stored_hash
+
+# ----------------- Image / Preprocessing Helpers -----------------
 def gabor_filter(img, ksize=21, sigma=5.0, theta=0, lambd=10.0, gamma=0.5):
-    """Apply a single Gabor kernel and return filtered image."""
     kernel = cv2.getGaborKernel((ksize, ksize), sigma, theta, lambd, gamma, 0, ktype=cv2.CV_32F)
     filtered = cv2.filter2D(img, cv2.CV_8UC3, kernel)
     return filtered
 
 def enhance_ridges(gray):
-    """Enhance ridge structure using histogram equalization + multi-orientation Gabor filtering."""
-    # CLAHE equalization
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     eq = clahe.apply(gray)
-
-    # Combine multiple Gabor responses (several orientations)
     accum = np.zeros_like(eq, dtype=np.float32)
     for theta in np.linspace(0, np.pi, 6, endpoint=False):
         resp = gabor_filter(eq, ksize=21, sigma=4.0, theta=theta, lambd=12.0, gamma=0.5)
-        # Convert to float and accumulate the absolute response
         accum += np.abs(resp.astype(np.float32) - np.mean(resp))
-
-    # Normalize accumulation to 0..255
     accum = cv2.normalize(accum, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    # Smooth and threshold adaptively
     blurred = cv2.GaussianBlur(accum, (3,3), 0)
     th = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 11, 2)
     return th
 
-# ----------------- Minutiae Extraction -----------------
 def compute_orientation_at(img_float, y, x, window=7):
-    """Estimate ridge orientation (in degrees) at a pixel using gradients around a small window."""
     h, w = img_float.shape
     r = window // 2
     ys = max(0, y-r); ye = min(h, y+r+1)
@@ -105,33 +136,22 @@ def compute_orientation_at(img_float, y, x, window=7):
         return 0.0
     gx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(patch, cv2.CV_64F, 0, 1, ksize=3)
-    # compute average gradient direction
     gxx = np.sum(gx * gx)
     gyy = np.sum(gy * gy)
     gxy = np.sum(gx * gy)
-    # orientation in radians: 0.5 * atan2(2*gxy, gxx - gyy)
     denom = (gxx - gyy)
     angle_rad = 0.5 * math.atan2(2.0 * gxy, denom + 1e-8)
     angle_deg = math.degrees(angle_rad)
-    # normalize to 0..180
     angle_deg = (angle_deg + 180.0) % 180.0
     return float(angle_deg)
 
 def extract_minutiae_with_orientation(processed_img):
-    """
-    processed_img: binary image (0 ridge, 255 background) expected.
-    returns list of minutiae dicts: {'x':int,'y':int,'type':'ending'|'bifurcation','angle':float}
-    """
     binary = (processed_img == 0)
-    skeleton = skeletonize(binary).astype(np.uint8)  # 0/1
+    skeleton = skeletonize(binary).astype(np.uint8)
     rows, cols = skeleton.shape
-
     minutiae = []
-    # Precompute float grayscale version for orientation estimate
-    # we want intensity where ridges are dark, so invert processed_img to float
     img_float = processed_img.astype(np.float32)
-    img_float = 255.0 - img_float  # ridges brighter in this float image
-
+    img_float = 255.0 - img_float
     for i in range(1, rows - 1):
         for j in range(1, cols - 1):
             if skeleton[i, j]:
@@ -159,218 +179,239 @@ def draw_minutiae_on_image(processed_img, minutiae):
             cv2.circle(img_color, (x, y), 3, (0, 0, 255), -1)
         else:
             cv2.circle(img_color, (x, y), 3, (0, 255, 0), -1)
-            # draw orientation line
-            ang = math.radians(m['angle'])
-            x2 = int(round(x + 8 * math.cos(ang)))
-            y2 = int(round(y + 8 * math.sin(ang)))
-            cv2.line(img_color, (x, y), (x2, y2), (255, 0, 0), 1)
+        ang = math.radians(m['angle'])
+        x2 = int(round(x + 8 * math.cos(ang)))
+        y2 = int(round(y + 8 * math.sin(ang)))
+        cv2.line(img_color, (x, y), (x2, y2), (255, 0, 0), 1)
     return img_color
 
-# ----------------- Matching Logic -----------------
-def match_minutiae_sets(set_in, set_db, spatial_tol=SPATIAL_TOLERANCE, angle_tol=ANGLE_TOLERANCE):
-    """
-    set_in and set_db: lists of dicts with x,y,type,angle.
-    returns fractional match score (0..1)
-    """
-    matched = 0
-    db_used = [False] * len(set_db)
-
-    for mi in set_in:
-        xi, yi, ti, ai = mi['x'], mi['y'], mi['type'], mi['angle']
-        for idx, mj in enumerate(set_db):
-            if db_used[idx]:
+# ----------------- RANSAC-based Matching -----------------
+def build_candidate_pairs(min_in, min_db, max_dist=SPATIAL_TOLERANCE, angle_tol=ANGLE_TOLERANCE):
+    """Return list of (src_pt, dst_pt) pairs where types match and within max_dist and angle_tol."""
+    pairs = []
+    for a in min_in:
+        for b in min_db:
+            if a['type'] != b['type']:
                 continue
-            xj, yj, tj, aj = mj['x'], mj['y'], mj['type'], mj['angle']
-            if ti != tj:
-                continue
-            if abs(xi - xj) <= spatial_tol and abs(yi - yj) <= spatial_tol:
-                # angle difference (circular)
-                diff = abs(ai - aj) % 180.0
+            dx = a['x'] - b['x']
+            dy = a['y'] - b['y']
+            d = math.hypot(dx, dy)
+            if d <= max_dist:
+                # angle diff circular
+                diff = abs(a['angle'] - b['angle']) % 180.0
                 diff = min(diff, 180.0 - diff)
                 if diff <= angle_tol:
-                    matched += 1
-                    db_used[idx] = True
-                    break
-    total = max(len(set_in), len(set_db), 1)
-    return matched / total
+                    pairs.append(((a['x'], a['y']), (b['x'], b['y'])))
+    return pairs
 
-# ----------------- GUI App Class -----------------
+def ransac_match(min_in, min_db):
+    """
+    Attempt RANSAC alignment. Returns (score, inlier_count, transform_matrix or None)
+    score = inliers / max(len(min_in), len(min_db))
+    """
+    # Build candidate pairs with a larger initial tolerance to allow RANSAC to refine
+    candidates = build_candidate_pairs(min_in, min_db, max_dist=SPATIAL_TOLERANCE * 2, angle_tol=ANGLE_TOLERANCE * 1.2)
+    if len(candidates) < 3:
+        # Not enough correspondences for affine estimation
+        return 0.0, 0, None
+
+    src_pts = np.array([p[0] for p in candidates], dtype=np.float32)
+    dst_pts = np.array([p[1] for p in candidates], dtype=np.float32)
+
+    # Use OpenCV estimateAffinePartial2D with RANSAC
+    try:
+        M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,
+                                                 ransacReprojThreshold=RANSAC_REPROJ_THRESH,
+                                                 maxIters=2000, confidence=0.99)
+    except Exception as e:
+        logging.exception("estimateAffinePartial2D failed")
+        return 0.0, 0, None
+
+    if M is None or inliers is None:
+        return 0.0, 0, None
+
+    inlier_count = int(np.sum(inliers))
+    score = inlier_count / max(len(min_in), len(min_db), 1)
+    return float(score), int(inlier_count), M
+
+# ----------------- GUI App -----------------
 class FingerprintApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Fingerprint System — Enroll & Verify (v2)")
-        self.root.geometry("820x620")
+        self.root.title("Fingerprint Verification System")
+        self.root.geometry("900x700")
         self.root.resizable(False, False)
 
         self.image_path = None
-        self.tk_img = None  # keep reference to avoid GC
+        self.tk_img = None
         self.tk_img_matched = None
 
-        # Ensure DB tables exist
-        if not ensure_tables():
-            logging.warning("ensure_tables failed or DB unreachable")
+        # admin state
+        self.admin_user = None  # username when logged in
+        self.admin_authed = False
+
+        if not ensure_schema():
+            logging.warning("DB schema ensure failed or DB unreachable")
 
         # ttk style
         self.style = ttk.Style()
         self.style.theme_use('clam')
-        self.style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), background="#e9e9e9")
+        self.style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"))
 
         main = ttk.Frame(root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Label(main, text="Fingerprint Enrollment & Verification (v2)", style="Header.TLabel", anchor="center")
-        header.pack(fill=tk.X, pady=(0,8))
+        header = ttk.Label(main, text="Fingerprint Verification System", style="Header.TLabel")
+        header.pack(fill=tk.X, pady=(0, 8))
 
-        # Input row
-        row1 = ttk.Frame(main)
-        row1.pack(fill=tk.X, pady=6)
-        ttk.Label(row1, text="Student Name:").pack(side=tk.LEFT, padx=(0,8))
-        self.name_entry = ttk.Entry(row1, width=42)
-        self.name_entry.pack(side=tk.LEFT)
+        # row: name + buttons
+        controls = ttk.Frame(main)
+        controls.pack(fill=tk.X, pady=6)
+        ttk.Label(controls, text="Student Name:").pack(side=tk.LEFT)
+        self.name_entry = ttk.Entry(controls, width=40)
+        self.name_entry.pack(side=tk.LEFT, padx=(6, 12))
 
-        # Top area: Left preview (selected / processed) and right preview (matched)
+        self.btn_select = ttk.Button(controls, text="Select Image", command=self.select_image)
+        self.btn_select.pack(side=tk.LEFT, padx=4)
+        self.btn_enroll = ttk.Button(controls, text="Enroll", command=self.process_and_save)
+        self.btn_enroll.pack(side=tk.LEFT, padx=4)
+        self.btn_verify = ttk.Button(controls, text="Verify", command=self.verify_fingerprint)
+        self.btn_verify.pack(side=tk.LEFT, padx=4)
+
+        # admin controls
+        admin_frame = ttk.Frame(main)
+        admin_frame.pack(fill=tk.X, pady=(8, 6))
+        self.lbl_admin = ttk.Label(admin_frame, text="Not logged in")
+        self.lbl_admin.pack(side=tk.LEFT)
+        ttk.Button(admin_frame, text="Admin Login", command=self.open_admin_login).pack(side=tk.LEFT, padx=6)
+        ttk.Button(admin_frame, text="Export DB", command=self.export_db).pack(side=tk.LEFT, padx=4)
+        ttk.Button(admin_frame, text="Import DB", command=self.import_db).pack(side=tk.LEFT, padx=4)
+
+        # preview area
         preview_frame = ttk.Frame(main)
         preview_frame.pack(pady=8, fill=tk.X)
 
-        left_frame = ttk.Frame(preview_frame)
-        left_frame.pack(side=tk.LEFT, padx=6)
-        ttk.Label(left_frame, text="Selected / Processed").pack()
-        self.canvas_left = tk.Canvas(left_frame, width=360, height=300, bg="#dcdcdc", highlightthickness=0)
+        left = ttk.Frame(preview_frame)
+        left.pack(side=tk.LEFT, padx=6)
+        ttk.Label(left, text="Selected / Processed").pack()
+        self.canvas_left = tk.Canvas(left, width=420, height=360, bg="#dcdcdc")
         self.canvas_left.pack()
-        self.canvas_left.create_text(180,150, text="No Image Selected", fill="#333", font=("Segoe UI", 12))
+        self.canvas_left.create_text(210, 180, text="No Image Selected", fill="#333")
 
-        right_frame = ttk.Frame(preview_frame)
-        right_frame.pack(side=tk.LEFT, padx=12)
-        ttk.Label(right_frame, text="Matched (Verification Result)").pack()
-        self.canvas_right = tk.Canvas(right_frame, width=360, height=300, bg="#dcdcdc", highlightthickness=0)
+        right = ttk.Frame(preview_frame)
+        right.pack(side=tk.LEFT, padx=12)
+        ttk.Label(right, text="Matched (Verification Result)").pack()
+        self.canvas_right = tk.Canvas(right, width=420, height=360, bg="#dcdcdc")
         self.canvas_right.pack()
-        self.canvas_right.create_text(180,150, text="No Match Yet", fill="#333", font=("Segoe UI", 12))
+        self.canvas_right.create_text(210, 180, text="No Match Yet", fill="#333")
 
-        # Buttons and progress
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(pady=8)
-
-        self.btn_select = ttk.Button(btn_frame, text="Select Image", command=self.select_image, width=20)
-        self.btn_select.grid(row=0, column=0, padx=6, pady=4)
-
-        self.btn_enroll = ttk.Button(btn_frame, text="Enroll Fingerprint", command=self.process_and_save, width=20)
-        self.btn_enroll.grid(row=1, column=0, padx=6, pady=4)
-
-        self.btn_verify = ttk.Button(btn_frame, text="Verify Fingerprint", command=self.verify_fingerprint, width=20)
-        self.btn_verify.grid(row=2, column=0, padx=6, pady=4)
-
-        self.btn_exit = ttk.Button(btn_frame, text="Exit", command=self.root.quit, width=20)
-        self.btn_exit.grid(row=3, column=0, padx=6, pady=4)
-
-        self.progress = ttk.Progressbar(main, orient=tk.HORIZONTAL, length=600, mode='determinate')
+        # status + progress
+        self.progress = ttk.Progressbar(main, orient=tk.HORIZONTAL, length=820, mode='determinate')
         self.progress.pack(pady=(10,0))
-
-        # status
-        self.status_label = ttk.Label(main, text="Ready", anchor="w")
+        self.status_label = ttk.Label(main, text="Ready")
         self.status_label.pack(fill=tk.X, pady=(6,0))
 
-    # Utility to enable/disable main buttons during background ops
+    # ---------- UI helpers ----------
+    def set_status(self, text):
+        self.status_label.config(text=text)
+
     def set_busy(self, busy=True):
         state = tk.DISABLED if busy else tk.NORMAL
-        self.btn_select.config(state=state)
-        self.btn_enroll.config(state=state)
-        self.btn_verify.config(state=state)
+        for b in (self.btn_select, self.btn_enroll, self.btn_verify):
+            b.config(state=state)
         if busy:
             self.set_status("Processing...")
         else:
             self.set_status("Ready")
 
-    # -------- Select fingerprint image --------
     def select_image(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")]
-        )
-        if file_path:
-            self.image_path = file_path
-            self.display_image_on_canvas(file_path, self.canvas_left)
-            self.set_status("Image Loaded")
-            logging.info(f"Loaded image: {file_path}")
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files","*.png;*.jpg;*.jpeg")])
+        if not file_path:
+            return
+        self.image_path = file_path
+        self.display_image_on_canvas(file_path, self.canvas_left)
+        self.set_status("Image loaded")
 
-    # -------- Display image on canvas helper --------
     def display_image_on_canvas(self, path_or_pil, canvas):
         try:
             if isinstance(path_or_pil, str):
                 img = Image.open(path_or_pil).convert("RGB")
             else:
                 img = path_or_pil.convert("RGB")
-            img.thumbnail((360, 300))
+            img.thumbnail((420, 360))
             tk_img = ImageTk.PhotoImage(img)
-            # assign to appropriate attribute so it won't be GC'd
             if canvas is self.canvas_left:
                 self.tk_img = tk_img
             else:
                 self.tk_img_matched = tk_img
             canvas.delete("all")
-            canvas.create_image(180, 150, image=tk_img)
+            canvas.create_image(210, 180, image=tk_img)
         except Exception as e:
-            logging.exception("display_image_on_canvas failed")
-            messagebox.showerror("Image Error", f"Could not open image:\n{e}")
-            canvas.delete("all")
-            canvas.create_text(180, 150, text="No Image Selected", fill="#333", font=("Segoe UI", 12))
+            logging.exception("display image failed")
+            messagebox.showerror("Image Error", str(e))
 
-    # -------- Fingerprint preprocessing (improved) --------
+    # ---------- Processing & Enrollment ----------
     def process_fingerprint(self, img_path):
         img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img_gray is None:
             raise ValueError("Unable to read image file")
-        # Basic smoothing & crop/resize if too big
         h, w = img_gray.shape
-        scale = 1.0
-        max_dim = 1024
+        max_dim = 1200
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)
             img_gray = cv2.resize(img_gray, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-
-        # Ridge enhancement pipeline
         processed = enhance_ridges(img_gray)
-
         return processed
 
-    # -------- Save to DB (features) --------
-    def save_to_db_features(self, name, minutiae_list):
+    def save_to_db_features(self, name, minutiae_list, fingerprint_bytes=None):
         cnx = connect_db()
         if cnx is None:
             return False
         try:
-            with closing(cnx.cursor()) as cursor:
-                # Insert minutiae JSON
-                j = json.dumps(minutiae_list)
-                cursor.execute("INSERT INTO students (name, minutiae) VALUES (%s, %s)", (name, j))
+            with closing(cnx.cursor()) as cur:
+                # upsert by name
+                minutiae_json = json.dumps(minutiae_list)
+                if fingerprint_bytes is None:
+                    cur.execute("""
+                        INSERT INTO students (name, minutiae, fingerprint)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE minutiae = VALUES(minutiae), fingerprint = COALESCE(VALUES(fingerprint), fingerprint)
+                    """, (name, minutiae_json, None))
+                else:
+                    cur.execute("""
+                        INSERT INTO students (name, minutiae, fingerprint)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE minutiae = VALUES(minutiae), fingerprint = VALUES(fingerprint)
+                    """, (name, minutiae_json, fingerprint_bytes))
             cnx.commit()
-            logging.info(f"Saved features for {name} (points: {len(minutiae_list)})")
+            logging.info(f"Saved/updated student {name}")
             return True
         except Exception as e:
             logging.exception("save_to_db_features failed")
-            messagebox.showerror("DB Error", f"Error: {e}")
+            messagebox.showerror("DB Error", f"Error saving to DB: {e}")
             return False
         finally:
             cnx.close()
 
-    # -------- Enroll Fingerprint --------
     def process_and_save(self):
         name = self.name_entry.get().strip()
         if not name:
-            messagebox.showwarning("Input Error", "Please enter student name")
+            messagebox.showwarning("Input Error", "Enter student name")
             return
         if not self.image_path:
-            messagebox.showwarning("Input Error", "Please select a fingerprint image")
+            messagebox.showwarning("Input Error", "Select fingerprint image")
             return
 
-        # UI busy
         self.set_busy(True)
         self.progress['value'] = 5
-        self.root.update_idletasks()
+        self.root_update()
+
         try:
             processed = self.process_fingerprint(self.image_path)
             self.progress['value'] = 30
-            self.root.update_idletasks()
+            self.root_update()
         except Exception as e:
-            logging.exception("process_fingerprint failed")
+            logging.exception("processing failed")
             messagebox.showerror("Processing Error", str(e))
             self.set_busy(False)
             self.progress['value'] = 0
@@ -378,136 +419,318 @@ class FingerprintApp:
 
         minutiae, skeleton = extract_minutiae_with_orientation(processed)
         self.progress['value'] = 70
-        self.root.update_idletasks()
+        self.root_update()
 
-        img_with_minutiae = draw_minutiae_on_image(processed, minutiae)
+        # show visualization
+        vis = draw_minutiae_on_image(processed, minutiae)
+        pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        self.display_image_on_canvas(pil, self.canvas_left)
 
-        # Show processed image with minutiae in GUI
-        pil_img = Image.fromarray(cv2.cvtColor(img_with_minutiae, cv2.COLOR_BGR2RGB))
-        self.display_image_on_canvas(pil_img, self.canvas_left)
-        msg = f"Ridge Endings/Bifs: {sum(1 for m in minutiae if m['type']=='ending')}/{sum(1 for m in minutiae if m['type']=='bifurcation')}"
-        self.set_status(f"Processed — {msg}")
-        messagebox.showinfo("Minutiae Points", msg)
+        # encode fingerprint image bytes (optional)
+        success, enc = cv2.imencode('.png', processed)
+        fingerprint_bytes = enc.tobytes() if success else None
 
-        # Save features (JSON) to DB
-        saved = self.save_to_db_features(name, minutiae)
+        saved = self.save_to_db_features(name, minutiae, fingerprint_bytes=fingerprint_bytes)
         if saved:
-            self.set_status(f"Saved: {name} | {msg}")
-            messagebox.showinfo("Success", f"Fingerprint features saved for '{name}' with {msg}")
-            logging.info(f"Enrollment success for {name}")
+            messagebox.showinfo("Saved", f"Enrollment saved for {name} (points: {len(minutiae)})")
+            logging.info(f"Enrollment: {name} saved")
+            self.set_status(f"Saved {name}")
         else:
-            self.set_status("Failed to save to DB")
-            logging.error("Failed to save features to DB")
+            self.set_status("Save failed")
         self.progress['value'] = 0
         self.set_busy(False)
 
-    # -------- Verify Fingerprint --------
+    # ---------- Verification with RANSAC ----------
     def verify_fingerprint(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")]
-        )
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files","*.png;*.jpg;*.jpeg")])
         if not file_path:
             return
-
-        # busy UI
         self.set_busy(True)
         self.progress['value'] = 5
-        self.root.update_idletasks()
+        self.root_update()
+
         try:
             processed_input = self.process_fingerprint(file_path)
-            self.progress['value'] = 30
-            self.root.update_idletasks()
+            self.progress['value'] = 20
+            self.root_update()
         except Exception as e:
-            logging.exception("process_fingerprint failed during verify")
-            messagebox.showerror("Processing Error", f"Could not process input image:\n{e}")
+            logging.exception("processing input failed")
+            messagebox.showerror("Processing Error", str(e))
             self.set_busy(False)
             self.progress['value'] = 0
             return
 
         minutiae_input, _ = extract_minutiae_with_orientation(processed_input)
-        self.progress['value'] = 50
-        self.root.update_idletasks()
-
-        # Display the processed input on left canvas
-        img_left = draw_minutiae_on_image(processed_input, minutiae_input)
-        pil_left = Image.fromarray(cv2.cvtColor(img_left, cv2.COLOR_BGR2RGB))
+        vis_input = draw_minutiae_on_image(processed_input, minutiae_input)
+        pil_left = Image.fromarray(cv2.cvtColor(vis_input, cv2.COLOR_BGR2RGB))
         self.display_image_on_canvas(pil_left, self.canvas_left)
 
-        # query DB for all stored features
+        # fetch DB entries
         cnx = connect_db()
         if cnx is None:
             self.set_busy(False)
-            self.progress['value'] = 0
             return
-
-        best_match = None
-        best_score = 0.0
         try:
-            with closing(cnx.cursor()) as cursor:
-                cursor.execute("SELECT name, minutiae FROM students")
-                rows = cursor.fetchall()
+            with closing(cnx.cursor()) as cur:
+                cur.execute("SELECT name, minutiae, fingerprint FROM students")
+                rows = cur.fetchall()
         except Exception as e:
-            logging.exception("DB fetch failed")
-            messagebox.showerror("DB Error", f"Error fetching records:\n{e}")
+            logging.exception("fetch failed")
+            messagebox.showerror("DB Error", f"Error fetching DB: {e}")
             cnx.close()
             self.set_busy(False)
-            self.progress['value'] = 0
             return
         finally:
             cnx.close()
 
-        self.progress['value'] = 60
-        self.root.update_idletasks()
+        best_score = 0.0
+        best_match = None
 
-        for idx, (name, minutiae_json) in enumerate(rows):
+        for idx, (name, minutiae_json, fingerprint_blob) in enumerate(rows):
             try:
-                # Parse JSON to list of dicts
-                db_minutiae = json.loads(minutiae_json)
+                db_minutiae = json.loads(minutiae_json) if minutiae_json else []
             except Exception:
-                logging.exception("Failed to decode minutiae JSON")
-                continue
+                logging.exception("bad minutiae JSON")
+                db_minutiae = []
 
-            score = match_minutiae_sets(minutiae_input, db_minutiae)
-            logging.info(f"Comparing with {name} -> score: {score:.3f}")
+            # First, try RANSAC matching
+            score, inliers, M = ransac_match(minutiae_input, db_minutiae)
+            logging.info(f"Compared to {name}: ransac score={score:.3f}, inliers={inliers}")
+            # If RANSAC fails or score low, fallback to simple pairwise matching
+            if score < MATCH_THRESHOLD:
+                # fallback: pairwise proportion matching (without alignment)
+                score_fallback = simple_pairwise_score(minutiae_input, db_minutiae)
+                logging.info(f"  fallback score={score_fallback:.3f}")
+                if score_fallback > score:
+                    score = score_fallback
+
             if score > best_score:
                 best_score = score
-                best_match = (name, db_minutiae)
-            # update progress nicely
-            self.progress['value'] = 60 + int(30 * (idx+1) / max(len(rows),1))
-            self.root.update_idletasks()
+                best_match = (name, db_minutiae, fingerprint_blob, M)
 
-        # Decision
+            # update progress visually
+            self.progress['value'] = 20 + int(70 * (idx+1)/max(len(rows),1))
+            self.root_update()
+
+        # Decision & visualization
         if best_match and best_score >= MATCH_THRESHOLD:
-            name, db_minutiae = best_match
-            # Reconstruct a small visualization of matched template (approx)
-            # For demonstration: render a blank image and draw db_minutiae
-            h, w = processed_input.shape
-            vis = np.full((h, w), 255, dtype=np.uint8)
-            vis_img = draw_minutiae_on_image(vis, db_minutiae)
-            pil_right = Image.fromarray(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
-            self.display_image_on_canvas(pil_right, self.canvas_right)
-            msg = f"Match Found: {name} (Score: {best_score:.2f})"
+            name, db_minutiae, fingerprint_blob, M = best_match
+            # Visualize db_minutiae on right canvas, and if fingerprint blob available show it
+            if fingerprint_blob:
+                try:
+                    nparr = np.frombuffer(fingerprint_blob, np.uint8)
+                    db_img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                    if db_img is not None:
+                        vis_db = draw_minutiae_on_image(db_img, db_minutiae)
+                        pil_right = Image.fromarray(cv2.cvtColor(vis_db, cv2.COLOR_BGR2RGB))
+                        self.display_image_on_canvas(pil_right, self.canvas_right)
+                    else:
+                        # fallback: draw on blank canvas
+                        self.draw_minutiae_on_blank(db_minutiae)
+                except Exception:
+                    logging.exception("failed to render fingerprint blob")
+                    self.draw_minutiae_on_blank(db_minutiae)
+            else:
+                self.draw_minutiae_on_blank(db_minutiae)
+            msg = f"Match: {name} (score={best_score:.2f})"
             self.set_status(msg)
-            messagebox.showinfo("Verification Result", msg)
-            logging.info(f"Verification matched {name} score={best_score:.3f}")
+            messagebox.showinfo("Verification", msg)
+            logging.info(f"Verification match: {name} score={best_score:.3f}")
         else:
             self.canvas_right.delete("all")
-            self.canvas_right.create_text(180,150, text="No Match Found", fill="#900", font=("Segoe UI", 12))
+            self.canvas_right.create_text(210,180, text="No Match Found", fill="#900")
             self.set_status("No Match Found")
-            messagebox.showwarning("Verification Failed", "No matching fingerprint found.")
-            logging.info("Verification failed - no match")
+            messagebox.showwarning("Verification", "No matching fingerprint found.")
+            logging.info("Verification: no match")
 
         self.progress['value'] = 0
         self.set_busy(False)
 
-    # Utility
-    def set_status(self, text):
-        self.status_label.config(text=text)
+    def draw_minutiae_on_blank(self, minutiae):
+        h, w = 360, 420
+        blank = np.full((h, w), 255, dtype=np.uint8)
+        vis = draw_minutiae_on_image(blank, minutiae)
+        pil = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        self.display_image_on_canvas(pil, self.canvas_right)
 
+    # ---------- Admin Login ----------
+    def open_admin_login(self):
+        win = tk.Toplevel(self.root)
+        win.title("Admin Login")
+        win.geometry("320x160")
+        ttk.Label(win, text="Username:").pack(pady=(12,0))
+        ent_user = ttk.Entry(win)
+        ent_user.pack()
+        ttk.Label(win, text="Password:").pack(pady=(8,0))
+        ent_pass = ttk.Entry(win, show="*")
+        ent_pass.pack()
+        def do_login():
+            user = ent_user.get().strip()
+            pw = ent_pass.get()
+            if not user or not pw:
+                messagebox.showwarning("Input", "Enter credentials")
+                return
+            cnx = connect_db()
+            if cnx is None:
+                return
+            try:
+                with closing(cnx.cursor()) as cur:
+                    cur.execute("SELECT password_hash FROM users WHERE username=%s", (user,))
+                    row = cur.fetchone()
+                    if not row:
+                        messagebox.showerror("Login Failed", "User not found")
+                        return
+                    stored = row[0]
+                    if verify_password(user, pw, stored):
+                        self.admin_authed = True
+                        self.admin_user = user
+                        self.lbl_admin.config(text=f"Logged in: {user}")
+                        messagebox.showinfo("Login", "Admin authenticated")
+                        win.destroy()
+                    else:
+                        messagebox.showerror("Login Failed", "Wrong password")
+            except Exception as e:
+                logging.exception("admin login error")
+                messagebox.showerror("DB Error", str(e))
+            finally:
+                cnx.close()
+        ttk.Button(win, text="Login", command=do_login).pack(pady=12)
 
-# ----------------- Run App -----------------
+    # ---------- Export / Import DB ----------
+    def export_db(self):
+        # require admin login
+        if not self.admin_authed:
+            messagebox.showwarning("Permission", "Admin login required to export DB")
+            return
+
+        cnx = connect_db()
+        if cnx is None:
+            return
+
+        try:
+            with closing(cnx.cursor()) as cur:
+                cur.execute("SELECT name, fingerprint, minutiae, created_at FROM students")
+                rows = cur.fetchall()
+        except Exception as e:
+            logging.exception("export fetch failed")
+            messagebox.showerror("DB Error", str(e))
+            cnx.close()
+            return
+        finally:
+            cnx.close()
+
+        export_list = []
+        for name, fingerprint_blob, minutiae_json, created_at in rows:
+            fingerprint_b64 = None
+            if fingerprint_blob:
+                try:
+                    fingerprint_b64 = base64.b64encode(fingerprint_blob).decode('ascii')
+                except Exception:
+                    logging.exception(f"Failed to base64 encode fingerprint for {name}")
+                    fingerprint_b64 = None
+
+            if isinstance(minutiae_json, (bytes, bytearray)):
+                try:
+                    minutiae_json = minutiae_json.decode('utf-8')
+                except Exception:
+                    logging.exception(f"Failed to decode minutiae JSON for {name}")
+                    minutiae_json = "[]"
+            elif minutiae_json is None:
+                minutiae_json = "[]"
+
+            created_str = str(created_at) if created_at else ""
+
+            export_list.append({
+                "name": name,
+                "fingerprint_b64": fingerprint_b64,
+                "minutiae_json": minutiae_json,
+                "created_at": created_str
+            })
+
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(export_list, f, ensure_ascii=False, indent=2)
+            messagebox.showinfo("Export", f"DB exported {len(export_list)} records")
+        except Exception as e:
+            logging.exception("export save failed")
+            messagebox.showerror("File Error", str(e))
+
+    def import_db(self):
+        # require admin login
+        if not self.admin_authed:
+            messagebox.showwarning("Permission", "Admin login required to import DB")
+            return
+
+        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")])
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except Exception as e:
+            messagebox.showerror("File Error", f"Failed to read JSON: {e}")
+            return
+
+        cnx = connect_db()
+        if cnx is None:
+            return
+
+        inserted = 0
+        try:
+            with closing(cnx.cursor()) as cur:
+                for rec in records:
+                    name = rec.get("name")
+                    minutiae_json = rec.get("minutiae_json", "[]")
+                    fingerprint_b64 = rec.get("fingerprint_b64")
+                    fingerprint_bytes = None
+                    if fingerprint_b64:
+                        try:
+                            fingerprint_bytes = base64.b64decode(fingerprint_b64)
+                        except Exception:
+                            logging.warning(f"Failed to decode fingerprint for {name}")
+                            fingerprint_bytes = None
+                    try:
+                        cur.execute("""
+                            INSERT INTO students (name, minutiae, fingerprint)
+                            VALUES (%s,%s,%s)
+                            ON DUPLICATE KEY UPDATE minutiae=VALUES(minutiae), fingerprint=COALESCE(VALUES(fingerprint), fingerprint)
+                        """, (name, minutiae_json, fingerprint_bytes))
+                        inserted += 1
+                    except Exception:
+                        logging.exception(f"Failed to insert {name}")
+                cnx.commit()
+        finally:
+            cnx.close()
+        messagebox.showinfo("Import", f"Imported / updated {inserted} records")
+
+    # ---------- utility ----------
+    def root_update(self):
+        self.root.update_idletasks()
+
+# Simple pairwise fallback
+def simple_pairwise_score(min_in, min_db, max_dist=SPATIAL_TOLERANCE, angle_tol=ANGLE_TOLERANCE):
+    count = 0
+    for a in min_in:
+        for b in min_db:
+            if a['type'] != b['type']:
+                continue
+            d = math.hypot(a['x']-b['x'], a['y']-b['y'])
+            if d > max_dist:
+                continue
+            diff = abs(a['angle'] - b['angle']) % 180.0
+            diff = min(diff, 180.0-diff)
+            if diff <= angle_tol:
+                count += 1
+                break
+    return count / max(len(min_in), len(min_db), 1)
+
+# ------------------ Run App ------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = FingerprintApp(root)
     root.mainloop()
-
