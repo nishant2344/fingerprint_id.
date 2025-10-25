@@ -1,4 +1,3 @@
-# fingerprint_app_v2.py
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
@@ -511,3 +510,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = FingerprintApp(root)
     root.mainloop()
+
